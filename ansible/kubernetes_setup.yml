@@ -1,0 +1,181 @@
+---
+- name: Configure Kubernetes Master and Worker Nodes
+  hosts: master:workers
+  become: yes
+  vars:
+    kubernetes_version: "1.28.15"
+
+  tasks:
+    # Cleanup Tasks
+    - name: Stop kubelet and containerd services
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - containerd
+      ignore_errors: yes
+
+    - name: Free port 10250 if in use
+      shell: |
+        PID=$(lsof -i :10250 -t) || true
+        if [ -n "$PID" ]; then
+          kill -9 $PID
+        fi
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Kill lingering kubelet processes
+      command: pkill -f kubelet
+      ignore_errors: yes
+
+    - name: Reset Kubernetes
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Clear containerd containers
+      command: crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock rm -a
+      ignore_errors: yes
+      when: "'/var/run/containerd/containerd.sock' | stat | default({}) | dict2items | selectattr('value.stat.exists', 'equalto', true) | length > 0"
+
+    - name: Remove Kubernetes directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /etc/cni/net.d
+      ignore_errors: yes
+
+    - name: Remove kubelet drop-in config (if exists)
+      file:
+        path: /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf
+        state: absent
+      ignore_errors: yes
+
+    - name: Clear stale kubelet pod mounts
+      shell: |
+        if [ -d /var/lib/kubelet/pods ]; then
+          find /var/lib/kubelet/pods/ -type d -exec umount {} \; 2>/dev/null || true
+          rm -rf /var/lib/kubelet/pods/* || true
+        fi
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    # Configuration Tasks
+    - name: Wait for apt lock to be released
+      shell: |
+        while sudo lsof /var/lib/apt/lists/lock 2>/dev/null || sudo lsof /var/cache/apt/archives/lock 2>/dev/null || sudo lsof /var/lib/dpkg/lock-frontend 2>/dev/null; do
+          echo "Waiting for apt lock to be released..."
+          sleep 2
+        done
+      args:
+        executable: /bin/bash
+      register: apt_lock_wait
+      retries: 30
+      delay: 5
+      until: apt_lock_wait.rc == 0
+
+    - name: Install dependencies
+      apt:
+        name:
+          - curl
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+        state: present
+        update_cache: yes
+
+    - name: Ensure /etc/apt/keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Kubernetes repository GPG key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key"
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: "0644"
+
+    - name: Add Kubernetes repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: Install Kubernetes and containerd
+      apt:
+        name:
+          - "kubeadm={{ kubernetes_version }}-1.1"
+          - "kubelet={{ kubernetes_version }}-1.1"
+          - "kubectl={{ kubernetes_version }}-1.1"
+          - containerd
+        state: present
+        update_cache: yes
+
+    - name: Load br_netfilter kernel module
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Ensure br_netfilter module persists across reboots
+      copy:
+        content: "br_netfilter\n"
+        dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
+
+    - name: Configure sysctl settings for Kubernetes
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+        dest: /etc/sysctl.d/k8s.conf
+        mode: "0644"
+      notify: Apply sysctl settings
+
+    - name: Ensure /etc/containerd directory exists
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: Generate default containerd config
+      command: containerd config default
+      register: containerd_config
+
+    - name: Write containerd config with correct pause image
+      copy:
+        content: "{{ containerd_config.stdout | regex_replace('sandbox_image = \".+\"', 'sandbox_image = \"registry.k8s.io/pause:3.9\"') }}"
+        dest: /etc/containerd/config.toml
+        mode: "0644"
+      notify: Restart Containerd
+
+    - name: Ensure containerd is started and enabled
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Ensure kubelet is started and enabled
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: Pre-pull Kubernetes images
+      command: kubeadm config images pull
+      ignore_errors: yes
+
+  handlers:
+    - name: Apply sysctl settings
+      command: sysctl -p /etc/sysctl.d/k8s.conf
+
+    - name: Restart Containerd
+      systemd:
+        name: containerd
+        state: restarted
